@@ -452,12 +452,12 @@ func GetPublicKeyByID(keyID int64) (*PublicKey, error) {
 // and returns public key found.
 func SearchPublicKeyByContent(content string) (*PublicKey, error) {
 	key := new(PublicKey)
-	has, err := x.Where("content like ?", content+"%").Get(key)
-	if err != nil {
-		return nil, err
-	} else if !has {
-		return nil, ErrKeyNotExist{}
-	}
+	// has, err := x.Where("content like ?", content+"%").Get(key)
+	// if err != nil {
+	// 	return nil, err
+	// } else if !has {
+	// 	return nil, ErrKeyNotExist{}
+	// }
 	return key, nil
 }
 

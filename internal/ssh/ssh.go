@@ -11,8 +11,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"unicode"
 
 	"github.com/unknwon/com"
 	"golang.org/x/crypto/ssh"
@@ -74,45 +78,107 @@ func handleServerConn(keyID string, chans <-chan ssh.NewChannel) {
 
 				case "exec":
 					cmdName := strings.TrimLeft(payload, "'()")
-					log.Trace("SSH: Payload: %v", cmdName)
+					log.Info("SSH: Payload: %v", cmdName)
 
 					args := []string{"serv", "key-" + keyID, "--config=" + conf.CustomConf}
-					log.Trace("SSH: Arguments: %v", args)
-					cmd := exec.Command(conf.AppPath(), args...)
-					cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND="+cmdName)
+					log.Info("SSH: Arguments: %v", args)
+					// cmd := exec.Command(conf.AppPath(), args...)
 
-					stdout, err := cmd.StdoutPipe()
-					if err != nil {
-						log.Error("SSH: StdoutPipe: %v", err)
-						return
-					}
-					stderr, err := cmd.StderrPipe()
-					if err != nil {
-						log.Error("SSH: StderrPipe: %v", err)
-						return
-					}
-					input, err := cmd.StdinPipe()
-					if err != nil {
-						log.Error("SSH: StdinPipe: %v", err)
-						return
-					}
-
-					// FIXME: check timeout
-					if err = cmd.Start(); err != nil {
-						log.Error("SSH: Start: %v", err)
-						return
+					cmdPartsTemp := strings.Split(cmdName, " ")
+					var cmdParts []string
+					for i := range cmdParts {
+						cmdPartsTemp[i] = strings.TrimSpace(cmdPartsTemp[i])
+						cmdPartsTemp[i] = fmt.Sprint(cmdPartsTemp[i])
+						cmdPartsTemp[i] = strings.Map(func(r rune) rune {
+							if unicode.IsPrint(r) {
+								return r
+							}
+							return -1
+						}, cmdPartsTemp[i])
+						if len(cmdPartsTemp[i]) > 0 {
+							cmdParts = append(cmdParts, cmdPartsTemp[i])
+							log.Trace("SSH: arg[%d] length %d, %s", i, len(cmdParts[i]), cmdParts[i])
+						}
 					}
 
-					_ = req.Reply(true, nil)
-					go func() {
-						_, _ = io.Copy(input, ch)
-					}()
-					_, _ = io.Copy(ch, stdout)
-					_, _ = io.Copy(ch.Stderr(), stderr)
+					if cmdParts[0] == "cat" {
+						filePath := cmdParts[1]
+						f, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+						if err != nil {
+							log.Error("SSH: open error: %v", err)
+							return
+						}
+						_, _ = io.Copy(f, ch)
+						f.Close()
+					} else {
+						if len(cmdParts) > 0 {
+							cmdParts[0], err = exec.LookPath(cmdParts[0])
+							if err != nil {
+								log.Error("SSH: cannot find %d: %v", cmdParts[0], err)
+								return
+							}
+						}
+						var cmd *exec.Cmd
+						if len(cmdParts) > 1 {
+							cmd = exec.Command(cmdParts[0], cmdParts[1:]...)
+						} else if len(cmdParts) == 1 {
+							cmd = exec.Command(cmdParts[0])
+						} else {
+							return
+						}
+						// cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND="+cmdName)
 
-					if err = cmd.Wait(); err != nil {
-						log.Error("SSH: Wait: %v", err)
-						return
+						stdout, err := cmd.StdoutPipe()
+						if err != nil {
+							log.Error("SSH: StdoutPipe: %v", err)
+							return
+						}
+						stderr, err := cmd.StderrPipe()
+						if err != nil {
+							log.Error("SSH: StderrPipe: %v", err)
+							return
+						}
+						input, err := cmd.StdinPipe()
+						if err != nil {
+							log.Error("SSH: StdinPipe: %v", err)
+							return
+						}
+						u, err := user.Current()
+						if err != nil {
+							log.Error("SSH: ERROR: %v", err)
+							return
+						}
+						uid, err := strconv.Atoi(u.Uid)
+						if err != nil {
+							log.Error("SSH: ERROR: %v", err)
+							return
+						}
+						gid, err := strconv.Atoi(u.Gid)
+						if err != nil {
+							log.Error("SSH: ERROR: %v", err)
+							return
+						}
+						cmd.SysProcAttr = &syscall.SysProcAttr{}
+						cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+
+						// FIXME: check timeout
+						log.Info("cmd: %s", cmd.String())
+						if err = cmd.Start(); err != nil {
+							log.Error("SSH: Start: %v", err)
+							return
+						}
+
+						_ = req.Reply(true, nil)
+						go func() {
+							_, _ = io.Copy(input, ch)
+						}()
+						_, _ = io.Copy(ch, stdout)
+						_, _ = io.Copy(ch.Stderr(), stderr)
+
+						if err = cmd.Wait(); err != nil {
+							log.Error("SSH: Wait: %v", err)
+							return
+						}
 					}
 
 					_, _ = ch.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
@@ -178,12 +244,13 @@ func Listen(host string, port int, ciphers, macs []string) {
 		},
 	}
 
-	keyPath := filepath.Join(conf.Server.AppDataPath, "ssh", "gogs.rsa")
+	keyPath := filepath.Join(conf.Server.AppDataPath, "ssh", fmt.Sprintf("gogs_%d.rsa", port))
 	if !com.IsExist(keyPath) {
 		if err := os.MkdirAll(filepath.Dir(keyPath), os.ModePerm); err != nil {
 			panic(err)
 		}
-		_, stderr, err := com.ExecCmd(conf.SSH.KeygenPath, "-f", keyPath, "-t", "rsa", "-m", "PEM", "-N", "")
+		path, _ := exec.LookPath("ssh-keygen")
+		_, stderr, err := com.ExecCmd(path, "-f", keyPath, "-t", "rsa", "-m", "PEM", "-N", "")
 		if err != nil {
 			panic(fmt.Sprintf("Failed to generate private key: %v - %s", err, stderr))
 		}
